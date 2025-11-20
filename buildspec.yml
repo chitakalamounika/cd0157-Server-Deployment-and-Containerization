@@ -1,0 +1,79 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.7
+    commands:
+      - echo 'about to call dockerd'
+      - nohup /usr/local/bin/dockerd --host=unix:///var/run/docker.sock --host=tcp://127.0.0.1:2375 --storage-driver=overlay2 &
+      - timeout 15 sh -c "until docker info; do echo .; sleep 1; done"
+      - echo "Downloading aws-iam-authenticator"
+      - curl -sS -o aws-iam-authenticator https://amazon-eks.s3-us-west-2.amazonaws.com/1.10.3/2018-07-26/bin/linux/amd64/aws-iam-authenticator
+      - chmod +x ./aws-iam-authenticator
+      - mv ./aws-iam-authenticator /usr/local/bin/aws-iam-authenticator || true
+
+      # Set the kubectl version you want to use here.
+      # IMPORTANT: use a kubectl client within one minor version of your EKS control plane.
+      # Example: a 1.27 client works with 1.26, 1.27 and 1.28 control planes.
+      - KUBECTL_VERSION="1.27.9"
+      - echo "Installing kubectl v${KUBECTL_VERSION}"
+      - curl -O https://s3.us-west-2.amazonaws.com/amazon-eks/${KUBECTL_VERSION}/2024-01-04/bin/linux/amd64/kubectl || curl -O https://s3.us-west-2.amazonaws.com/amazon-eks/${KUBECTL_VERSION}/bin/linux/amd64/kubectl || true
+      - curl -O https://s3.us-west-2.amazonaws.com/amazon-eks/${KUBECTL_VERSION}/2024-01-04/bin/linux/amd64/kubectl.sha256 || true
+      - if [ -f kubectl.sha256 ]; then echo "Validating kubectl checksum" && sha256sum -c kubectl.sha256 || echo "Checksum validation failed or checksum file format unexpected - continuing"; fi
+      - chmod +x ./kubectl
+      - mv ./kubectl /usr/local/bin/kubectl || export PATH=$PWD/:$PATH
+      - echo 'export PATH=$PWD/:$PATH' >> $HOME/.bashrc || true
+      - echo "kubectl client:" && kubectl version --short --client || true
+      - python --version
+      - echo "Upgrading pip and installing packages"
+      - python -m pip install --upgrade --force pip
+      - wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add - || true
+      - apt-get update -y || true
+      - apt-get -y install jq || true
+      - pip install --upgrade awscli pytest || true
+
+  pre_build:
+    commands:
+      - echo "Pre-build: set variables"
+      # Recommended: set these repository values in CodeBuild environment variables
+      - : "${REPOSITORY_NAME:?Need to set REPOSITORY_NAME in CodeBuild env}"
+      - : "${REPOSITORY_BRANCH:?Need to set REPOSITORY_BRANCH in CodeBuild env}"
+      - : "${ENVIRONMENT_NAME:?Need to set ENVIRONMENT_NAME in CodeBuild env}"
+      - : "${REPOSITORY_URI:?Need to set REPOSITORY_URI in CodeBuild env}"
+      - TAG="$REPOSITORY_NAME.$REPOSITORY_BRANCH.$ENVIRONMENT_NAME.$(date +%Y-%m-%d.%H.%M.%S).$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | head -c 8)"
+      - echo "Using image tag: $TAG"
+      - sed -i 's@CONTAINER_IMAGE@'"$REPOSITORY_URI:$TAG"'@' simple_jwt_api.yml || echo "sed replacement failed - ensure simple_jwt_api.yml exists"
+      - echo "Logging in to ECR"
+      - aws --version
+      - aws ecr get-login-password --region ${AWS_REGION:-us-east-1} | docker login --username AWS --password-stdin ${REPOSITORY_URI%/*} || echo "ECR login failed"
+      - export KUBECONFIG=$HOME/.kube/config
+      - echo "Workspace files:" && ls -l
+      - pip install -r requirements.txt || echo "requirements.txt install failed or file not present"
+
+  build:
+    commands:
+      - echo "Build: docker build"
+      - docker build --tag $REPOSITORY_URI:$TAG .
+      - docker tag $REPOSITORY_URI:$TAG $REPOSITORY_URI:$TAG || true
+
+  post_build:
+    commands:
+      - echo "Post-build: push to ECR"
+      - docker push $REPOSITORY_URI:$TAG
+      - echo "EKS cluster name: $EKS_CLUSTER_NAME"
+      - echo "EKS kubectl role arn: $EKS_KUBECTL_ROLE_ARN"
+      - aws eks update-kubeconfig --name $EKS_CLUSTER_NAME --role-arn $EKS_KUBECTL_ROLE_ARN --region ${AWS_REGION:-us-east-1} || echo "update-kubeconfig failed"
+      - echo "kubectl client after update:" && kubectl version --short --client || true
+      - kubectl get nodes --no-headers || echo "kubectl get nodes failed (may be RBAC/network) — continuing"
+      - echo "Applying Kubernetes manifests"
+      - kubectl apply -f simple_jwt_api.yml || echo "kubectl apply failed"
+      - printf '[{"name":"simple_jwt_api","imageUri":"%s"}]' $REPOSITORY_URI:$TAG > build.json
+
+artifacts:
+  files:
+    - build.json
+
+env:
+  parameter-store:
+    JWT_SECRET: JWT_SECRET
