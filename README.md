@@ -86,3 +86,11 @@ Completing the project involves several steps:
 6. Create a CodeBuild stage which will build, test, and deploy your code
 
 For more detail about each of these steps, see the project lesson.
+
+## Application Endpoint (AWS Load Balancer)
+The application is deployed to AWS EKS and exposed via an external Elastic Load Balancer.
+**ELB URL (Public Endpoint):**  
+http://a55daf815b8ae41ad8bb43fd8e255b4d-1a31fb90bd1600fd.elb.us-east-2.amazonaws.com
+You can test the health of the service using:
+curl http://a55daf815b8ae41ad8bb43fd8e255b4d-1a31fb90bd1600fd.elb.us-east-2.amazonaws.com/
+
